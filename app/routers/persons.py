@@ -1,9 +1,10 @@
+import json
 from uuid import UUID
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, text
-from sqlalchemy.orm import selectinload
+from openai import AsyncOpenAI
 
 from app.database import get_db
 from app.models.person import Person
@@ -15,10 +16,66 @@ from app.routers.auth import get_current_user, require_role
 from app.models.user import User
 from app.services.duplicate import find_duplicates
 from app.services.embedding import embed_text
+from app.services.chunker import extract_pdf_text
+from app.config import get_settings
 
 router = APIRouter(prefix="/api/persons", tags=["persons"])
+settings = get_settings()
 
+# --- НОВАЯ KILLER FEATURE: AI-Экстракция ---
+@router.post("/extract", status_code=200)
+async def auto_extract_person_data(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user)
+):
+    """Анализирует документ (PDF/Скан/Текст) и извлекает данные о репрессированном в формате JSON."""
+    content = await file.read()
+    filename = file.filename.lower() if file.filename else ""
+    
+    # 1. Читаем текст (сработает и OCR для сканов!)
+    if filename.endswith(".pdf"):
+        raw_text = extract_pdf_text(content)
+    else:
+        raw_text = content.decode("utf-8", errors="replace")
 
+    if not raw_text.strip():
+        raise HTTPException(400, "Не удалось распознать текст на документе")
+
+    # 2. Отправляем в OpenAI с жестким форматом JSON
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
+    
+    prompt = f"""
+    Ты - опытный архивариус. Проанализируй исторический документ и извлеки данные о репрессированном.
+    Верни ТОЛЬКО валидный JSON со следующими ключами (если данных нет, пиши null, не придумывай):
+    - full_name (строка, ФИО полностью)
+    - birth_year (целое число или null)
+    - death_year (целое число или null)
+    - region (строка: Чуйская область, Ошская область и т.д.)
+    - district (строка, район или город)
+    - occupation (строка, профессия)
+    - charge (строка, например '58-10')
+    - arrest_date (строка в формате YYYY-MM-DD)
+    - sentence (строка, приговор)
+    - sentence_date (строка в формате YYYY-MM-DD)
+    - rehabilitation_date (строка в формате YYYY-MM-DD)
+    - biography (строка, краткая суть дела на 2-3 предложения)
+
+    Текст документа:
+    {raw_text[:4000]}
+    """
+
+    try:
+        response = await client.chat.completions.create(
+            model=settings.chat_model,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"} # Заставляем ИИ вернуть идеальный JSON
+        )
+        extracted_data = json.loads(response.choices[0].message.content)
+        return extracted_data
+    except Exception as e:
+        raise HTTPException(500, f"Ошибка ИИ: {str(e)}")
+
+# --- СТАРЫЕ ЭНДПОИНТЫ ---
 @router.get("", response_model=PersonListResponse)
 async def list_persons(
     q: Optional[str] = None,
@@ -48,16 +105,14 @@ async def list_persons(
     if status:
         query = query.where(Person.status == status)
 
-    # Count
     count_q = select(func.count()).select_from(query.subquery())
     total = (await db.execute(count_q)).scalar_one()
 
-    # Paginate
     offset = (page - 1) * limit
     query = query.offset(offset).limit(limit)
     rows = (await db.execute(query)).scalars().all()
 
-    return PersonListResponse(items=rows, total=total, page=page, limit=limit)
+    return PersonListResponse(items=list(rows), total=total, page=page, limit=limit)
 
 
 @router.post("", response_model=PersonOut | DuplicateCheckResponse, status_code=201)
@@ -66,7 +121,6 @@ async def create_person(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # Duplicate check (skip if force=True)
     if not body.force:
         dupes = await find_duplicates(db, body.full_name)
         if dupes:
@@ -77,7 +131,6 @@ async def create_person(
                 message="Найдены похожие записи. Продолжить сохранение?"
             )
 
-    # Generate name embedding
     embedding = await embed_text(body.full_name)
 
     person = Person(
@@ -112,7 +165,6 @@ async def update_person(
     if not person:
         raise HTTPException(404, "Person not found")
 
-    # Only moderator/admin or the creator can update
     if current_user.role not in ("moderator", "admin") and person.created_by != current_user.id:
         raise HTTPException(403, "Forbidden")
 
