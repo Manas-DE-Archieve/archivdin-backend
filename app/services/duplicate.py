@@ -29,17 +29,22 @@ async def find_duplicates(
 
     # Phase 2: vector similarity
     name_embedding = await embed_text(full_name)
-    vec_str = "[" + ",".join(str(v) for v in name_embedding) + "]"
+
+    vec_str = "[" + ",".join(str(x) for x in name_embedding) + "]"
+
     vec_result = await db.execute(
         text("""
             SELECT id, full_name, birth_year, region,
-                   1 - (name_embedding <=> :vec::vector) AS score
+                1 - (name_embedding <=> CAST(:vec AS vector)) AS score
             FROM persons
             WHERE name_embedding IS NOT NULL
-            ORDER BY name_embedding <=> :vec::vector
+            ORDER BY name_embedding <=> CAST(:vec AS vector)
             LIMIT :limit
         """),
-        {"vec": vec_str, "limit": limit}
+        { 
+            "vec": vec_str,  # ✅ строка, а не list
+            "limit": limit
+        }
     )
     vec_rows = vec_result.mappings().all()
 
