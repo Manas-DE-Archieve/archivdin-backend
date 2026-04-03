@@ -66,13 +66,13 @@ async def find_duplicates(
 
 
 async def find_similar_documents(
-    db: AsyncSession, raw_text: str, threshold: float = 0.82, limit: int = 5
+    db: AsyncSession, raw_text: str, threshold: float = 0.60, limit: int = 5
 ) -> List[dict]:
     """
     Phase 1: vector similarity search on chunk embeddings.
-    Returns raw candidates (used internally before LLM validation).
+    Uses first 3000 chars for embedding to better capture overall content.
     """
-    sample = raw_text[:2000].strip()
+    sample = raw_text[:3000].strip()
     if not sample:
         return []
 
@@ -113,36 +113,37 @@ async def validate_duplicates_with_llm(
     candidates: List[dict],
 ) -> List[dict]:
     """
-    Phase 2: send top-3 candidates + uploaded text to LLM.
-    LLM decides which are TRUE content duplicates (same document, just re-uploaded)
-    vs merely topically related documents.
-    Returns only confirmed duplicates with updated scores.
+    Phase 2: LLM decides which candidates are TRUE duplicates.
+    A "duplicate" = same document even if slightly edited/reformatted.
     """
     if not candidates:
         return []
 
     client = AsyncOpenAI(api_key=settings.openai_api_key)
 
-    # Build comparison payload for LLM
     candidate_blocks = ""
     for i, c in enumerate(candidates, 1):
-        snippet = c["raw_text"][:600].replace("\n", " ")
+        snippet = c["raw_text"][:800].replace("\n", " ")
         candidate_blocks += f"\n[Документ {i}] id={c['id']} filename={c['filename']}\n{snippet}\n"
 
-    uploaded_snippet = uploaded_text[:600].replace("\n", " ")
+    uploaded_snippet = uploaded_text[:800].replace("\n", " ")
 
-    prompt = f"""Ты — система обнаружения дубликатов документов.
+    prompt = f"""Ты — система обнаружения дубликатов архивных документов.
+
 Загружаемый документ:
 {uploaded_snippet}
 
-Кандидаты из базы:
+Кандидаты из архива:
 {candidate_blocks}
 
-Задача: определи, какие из кандидатов являются НАСТОЯЩИМИ дубликатами загружаемого документа.
-Настоящий дубликат = тот же самый документ (один и тот же текст или очень незначительные отличия).
-Просто похожая тема — НЕ дубликат.
+Твоя задача: определить, является ли загружаемый документ дубликатом любого из кандидатов.
 
-Верни ТОЛЬКО JSON-массив (без markdown, без пояснений):
+ПРАВИЛА:
+- Дубликат = тот же документ, даже если изменено несколько слов, фраз, дат или имён
+- Дубликат = тот же документ с небольшими правками, дополнениями или сокращениями
+- НЕ дубликат = разные документы на похожую тему о разных людях или событиях
+
+Верни ТОЛЬКО JSON-массив (без markdown):
 [{{"id": "<uuid>", "is_duplicate": true/false, "score": 0.0-1.0}}]
 """
 
@@ -153,22 +154,20 @@ async def validate_duplicates_with_llm(
             response_format={"type": "json_object"},
             max_tokens=300,
         )
-        content = response.choices[0].message.content or "[]"
-        # The model may wrap in {"result": [...]} or return array directly
+        content = response.choices[0].message.content or "{}"
         parsed = json.loads(content)
         if isinstance(parsed, dict):
-            # find the array inside
             arr = next((v for v in parsed.values() if isinstance(v, list)), [])
         else:
             arr = parsed
     except Exception as e:
         print(f"WARNING: LLM duplicate validation failed: {e}. Falling back to vector scores.")
+        # Fallback: return candidates with score > 0.70
         return [
             {"id": str(c["id"]), "filename": c["filename"], "similarity_score": c["similarity_score"]}
-            for c in candidates
+            for c in candidates if c["similarity_score"] > 0.70
         ]
 
-    # Build id→filename map for confirmed duplicates
     id_to_meta = {str(c["id"]): c for c in candidates}
     confirmed = []
     for item in arr:

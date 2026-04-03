@@ -16,6 +16,7 @@ from app.models.user import User
 from app.services.chunker import chunk_text, extract_pdf_text
 from app.services.embedding import embed_batch, embed_text
 from app.services.duplicate import find_duplicates, find_similar_documents, validate_duplicates_with_llm
+from app.services.facts_generator import generate_and_save_facts
 from app.config import get_settings
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
@@ -111,7 +112,7 @@ async def check_document_duplicates(
         )
 
     # Phase 1: vector similarity (wider net, lower threshold)
-    candidates = await find_similar_documents(db, raw_text, threshold=0.78, limit=3)
+    candidates = await find_similar_documents(db, raw_text, threshold=0.60, limit=3)
 
     if not candidates:
         return DuplicateDocumentResponse(
@@ -190,6 +191,15 @@ async def upload_document(
 
     await db.commit()
     await db.refresh(doc)
+
+    # Generate facts in background (non-blocking for response)
+    import asyncio
+    from app.database import AsyncSessionLocal
+    async def _gen_facts():
+        async with AsyncSessionLocal() as bg_db:
+            await generate_and_save_facts(bg_db, doc.id, filename, raw_text)
+    asyncio.create_task(_gen_facts())
+
     return doc
 
 

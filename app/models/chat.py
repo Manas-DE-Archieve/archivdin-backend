@@ -8,8 +8,9 @@ from app.database import Base
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id    = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    title      = Column(Text, nullable=True)   # set from first user message
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
 
 

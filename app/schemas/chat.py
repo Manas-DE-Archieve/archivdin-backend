@@ -8,6 +8,7 @@ from pydantic import BaseModel
 class ChatSessionOut(BaseModel):
     id: UUID
     user_id: Optional[UUID] = None
+    title: Optional[str] = None
     created_at: datetime
 
     class Config:

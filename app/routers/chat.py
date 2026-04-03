@@ -75,7 +75,12 @@ async def send_message(
     body: MessageRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    await _get_session(session_id, db)
+    session = await _get_session(session_id, db)
+
+    # Set session title from first user message (truncated)
+    if not session.title:
+        session.title = body.content[:60] + ("…" if len(body.content) > 60 else "")
+        db.add(session)
 
     # Save user message
     user_msg = ChatMessage(session_id=session_id, role="user", content=body.content)
