@@ -2,9 +2,10 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# System deps for PyMuPDF and psycopg2
+# Устанавливаем системные зависимости для PyMuPDF, PostgreSQL и Tesseract OCR
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 libgl1 gcc libpq-dev \
+    tesseract-ocr tesseract-ocr-rus tesseract-ocr-kir \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

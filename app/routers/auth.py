@@ -6,7 +6,8 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 import bcrypt
-from jose import JWTError, jwt
+import jwt
+from jwt.exceptions import InvalidTokenError
 
 from app.database import get_db
 from app.models.user import User
@@ -58,7 +59,7 @@ async def get_current_user(
         user_id: str = payload.get("sub")
         if user_id is None:
             raise credentials_exception
-    except JWTError:
+    except InvalidTokenError:
         raise credentials_exception
 
     result = await db.execute(select(User).where(User.id == UUID(user_id)))
@@ -106,7 +107,7 @@ async def refresh_token(token: str, db: AsyncSession = Depends(get_db)):
             raise HTTPException(400, "Not a refresh token")
         user_id = payload["sub"]
         role = payload.get("role", "user")
-    except JWTError:
+    except InvalidTokenError:
         raise HTTPException(401, "Invalid token")
     return make_tokens(user_id, role)
 
