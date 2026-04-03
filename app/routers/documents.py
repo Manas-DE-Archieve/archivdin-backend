@@ -15,7 +15,7 @@ from app.routers.auth import get_current_user, require_role, get_optional_user
 from app.models.user import User
 from app.services.chunker import chunk_text, extract_pdf_text
 from app.services.embedding import embed_batch, embed_text
-from app.services.duplicate import find_duplicates, find_similar_documents
+from app.services.duplicate import find_duplicates, find_similar_documents, validate_duplicates_with_llm
 from app.config import get_settings
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
@@ -110,15 +110,24 @@ async def check_document_duplicates(
             ],
         )
 
-    # Semantic similarity via chunk embeddings
-    similar = await find_similar_documents(db, raw_text, threshold=0.75)
-    if similar:
+    # Phase 1: vector similarity (wider net, lower threshold)
+    candidates = await find_similar_documents(db, raw_text, threshold=0.78, limit=3)
+
+    if not candidates:
+        return DuplicateDocumentResponse(
+            duplicates_found=False,
+            message="Совпадений не найдено. Документ можно загрузить.",
+            similar_documents=[],
+        )
+
+    # Phase 2: LLM validates which candidates are TRUE duplicates
+    confirmed = await validate_duplicates_with_llm(raw_text, candidates)
+
+    if confirmed:
         return DuplicateDocumentResponse(
             duplicates_found=True,
-            message=f"Найдено {len(similar)} похожих документов.",
-            similar_documents=[
-                SimilarDocument(**s) for s in similar
-            ],
+            message=f"Найдено {len(confirmed)} похожих документов.",
+            similar_documents=[SimilarDocument(**s) for s in confirmed],
         )
 
     return DuplicateDocumentResponse(

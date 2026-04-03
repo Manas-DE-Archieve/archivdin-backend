@@ -1,61 +1,23 @@
+import json
 from typing import List
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
+from sqlalchemy import text, select
+from openai import AsyncOpenAI
 from app.services.embedding import embed_text
+from app.config import get_settings
 
-
-async def find_similar_documents(
-    db: AsyncSession, raw_text: str, threshold: float = 0.75, limit: int = 5
-) -> List[dict]:
-    """
-    Find existing documents similar to the given text using chunk embeddings.
-    Returns list of documents with avg similarity score (0–1), sorted descending.
-    """
-    # Embed only the first ~2000 chars as a representative sample
-    sample = raw_text[:2000].strip()
-    if not sample:
-        return []
-
-    embedding = await embed_text(sample)
-    vec_str = "[" + ",".join(str(x) for x in embedding) + "]"
-
-    result = await db.execute(
-        text("""
-            SELECT
-                d.id,
-                d.filename,
-                AVG(1 - (c.embedding <=> CAST(:vec AS vector))) AS avg_score
-            FROM chunks c
-            JOIN documents d ON d.id = c.document_id
-            WHERE c.embedding IS NOT NULL
-            GROUP BY d.id, d.filename
-            HAVING AVG(1 - (c.embedding <=> CAST(:vec AS vector))) > :threshold
-            ORDER BY avg_score DESC
-            LIMIT :limit
-        """),
-        {"vec": vec_str, "threshold": threshold, "limit": limit},
-    )
-    rows = result.mappings().all()
-    return [
-        {
-            "id": row["id"],
-            "filename": row["filename"],
-            "similarity_score": round(float(row["avg_score"]), 4),
-        }
-        for row in rows
-    ]
+settings = get_settings()
 
 
 async def find_duplicates(
     db: AsyncSession, full_name: str, threshold: float = 0.4, limit: int = 5
 ) -> List[dict]:
     """
-    Two-phase duplicate detection:
+    Two-phase duplicate detection for persons:
     1. Fuzzy name match via pg_trgm (fast)
     2. Semantic similarity via pgvector (precise)
     Returns merged, deduplicated list ranked by best score.
     """
-    # Phase 1: trigram similarity
     trgm_result = await db.execute(
         text("""
             SELECT id, full_name, birth_year, region,
@@ -69,9 +31,7 @@ async def find_duplicates(
     )
     trgm_rows = trgm_result.mappings().all()
 
-    # Phase 2: vector similarity
     name_embedding = await embed_text(full_name)
-
     vec_str = "[" + ",".join(str(x) for x in name_embedding) + "]"
 
     vec_result = await db.execute(
@@ -84,15 +44,10 @@ async def find_duplicates(
             ORDER BY name_embedding <=> CAST(:vec AS vector)
             LIMIT :limit
         """),
-        { 
-            "vec": vec_str,
-            "limit": limit,
-            "threshold": threshold  # Исправленный комментарий
-        }
+        {"vec": vec_str, "limit": limit, "threshold": threshold}
     )
     vec_rows = vec_result.mappings().all()
 
-    # Merge and deduplicate, keeping the highest score per id
     merged: dict[str, dict] = {}
     for row in list(trgm_rows) + list(vec_rows):
         pid = str(row["id"])
@@ -108,3 +63,121 @@ async def find_duplicates(
 
     candidates = sorted(merged.values(), key=lambda x: x["similarity_score"], reverse=True)
     return candidates[:limit]
+
+
+async def find_similar_documents(
+    db: AsyncSession, raw_text: str, threshold: float = 0.82, limit: int = 5
+) -> List[dict]:
+    """
+    Phase 1: vector similarity search on chunk embeddings.
+    Returns raw candidates (used internally before LLM validation).
+    """
+    sample = raw_text[:2000].strip()
+    if not sample:
+        return []
+
+    embedding = await embed_text(sample)
+    vec_str = "[" + ",".join(str(x) for x in embedding) + "]"
+
+    result = await db.execute(
+        text("""
+            SELECT
+                d.id,
+                d.filename,
+                d.raw_text,
+                AVG(1 - (c.embedding <=> CAST(:vec AS vector))) AS avg_score
+            FROM chunks c
+            JOIN documents d ON d.id = c.document_id
+            WHERE c.embedding IS NOT NULL
+            GROUP BY d.id, d.filename, d.raw_text
+            HAVING AVG(1 - (c.embedding <=> CAST(:vec AS vector))) > :threshold
+            ORDER BY avg_score DESC
+            LIMIT :limit
+        """),
+        {"vec": vec_str, "threshold": threshold, "limit": limit},
+    )
+    rows = result.mappings().all()
+    return [
+        {
+            "id": row["id"],
+            "filename": row["filename"],
+            "raw_text": row["raw_text"] or "",
+            "similarity_score": round(float(row["avg_score"]), 4),
+        }
+        for row in rows
+    ]
+
+
+async def validate_duplicates_with_llm(
+    uploaded_text: str,
+    candidates: List[dict],
+) -> List[dict]:
+    """
+    Phase 2: send top-3 candidates + uploaded text to LLM.
+    LLM decides which are TRUE content duplicates (same document, just re-uploaded)
+    vs merely topically related documents.
+    Returns only confirmed duplicates with updated scores.
+    """
+    if not candidates:
+        return []
+
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
+
+    # Build comparison payload for LLM
+    candidate_blocks = ""
+    for i, c in enumerate(candidates, 1):
+        snippet = c["raw_text"][:600].replace("\n", " ")
+        candidate_blocks += f"\n[Документ {i}] id={c['id']} filename={c['filename']}\n{snippet}\n"
+
+    uploaded_snippet = uploaded_text[:600].replace("\n", " ")
+
+    prompt = f"""Ты — система обнаружения дубликатов документов.
+Загружаемый документ:
+{uploaded_snippet}
+
+Кандидаты из базы:
+{candidate_blocks}
+
+Задача: определи, какие из кандидатов являются НАСТОЯЩИМИ дубликатами загружаемого документа.
+Настоящий дубликат = тот же самый документ (один и тот же текст или очень незначительные отличия).
+Просто похожая тема — НЕ дубликат.
+
+Верни ТОЛЬКО JSON-массив (без markdown, без пояснений):
+[{{"id": "<uuid>", "is_duplicate": true/false, "score": 0.0-1.0}}]
+"""
+
+    try:
+        response = await client.chat.completions.create(
+            model=settings.chat_model,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=300,
+        )
+        content = response.choices[0].message.content or "[]"
+        # The model may wrap in {"result": [...]} or return array directly
+        parsed = json.loads(content)
+        if isinstance(parsed, dict):
+            # find the array inside
+            arr = next((v for v in parsed.values() if isinstance(v, list)), [])
+        else:
+            arr = parsed
+    except Exception as e:
+        print(f"WARNING: LLM duplicate validation failed: {e}. Falling back to vector scores.")
+        return [
+            {"id": str(c["id"]), "filename": c["filename"], "similarity_score": c["similarity_score"]}
+            for c in candidates
+        ]
+
+    # Build id→filename map for confirmed duplicates
+    id_to_meta = {str(c["id"]): c for c in candidates}
+    confirmed = []
+    for item in arr:
+        if item.get("is_duplicate") and str(item.get("id")) in id_to_meta:
+            meta = id_to_meta[str(item["id"])]
+            confirmed.append({
+                "id": meta["id"],
+                "filename": meta["filename"],
+                "similarity_score": round(float(item.get("score", meta["similarity_score"])), 4),
+            })
+
+    return confirmed

@@ -9,7 +9,7 @@ from datetime import date
 from pathlib import Path
 
 from app.database import init_db, AsyncSessionLocal
-from app.routers import auth, persons, documents, chat, admin
+from app.routers import auth, persons, documents, chat, admin, facts
 from app.models import Person, Document, Chunk
 from app.services.embedding import embed_text, embed_batch
 from app.services.chunker import chunk_text
@@ -133,6 +133,7 @@ app.include_router(persons.router)
 app.include_router(documents.router)
 app.include_router(chat.router)
 app.include_router(admin.router)
+app.include_router(facts.router)
 
 @app.get("/health")
 async def health():

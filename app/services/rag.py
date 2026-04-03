@@ -25,7 +25,7 @@ async def retrieve_chunks(db: AsyncSession, question: str, top_k: int = 3) -> Li
 
     result = await db.execute(
         text("""
-            SELECT c.id, c.chunk_text, d.filename,
+            SELECT c.id, c.chunk_text, c.document_id, d.filename,
                    1 - (c.embedding <=> CAST(:vec AS vector)) AS score
             FROM chunks c
             JOIN documents d ON c.document_id = d.id
@@ -39,6 +39,7 @@ async def retrieve_chunks(db: AsyncSession, question: str, top_k: int = 3) -> Li
     return [
         {
             "chunk_id": str(row["id"]),
+            "document_id": str(row["document_id"]),
             "document_name": row["filename"],
             "chunk_text": row["chunk_text"],
             "score": round(float(row["score"]), 4),
