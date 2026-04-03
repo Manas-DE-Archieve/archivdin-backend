@@ -1,14 +1,14 @@
 import json
 from uuid import UUID
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from app.database import get_db
 from app.models.chat import ChatSession, ChatMessage
-from app.schemas.document import ChatSessionOut, ChatMessageOut, MessageRequest
+from app.schemas.document import ChatSessionOut, ChatSessionListResponse, ChatMessageOut, MessageRequest
 from app.routers.auth import get_current_user, oauth2_scheme
 from app.models.user import User
 from app.services.rag import stream_rag_answer
@@ -47,17 +47,23 @@ async def create_session(
     return session
 
 
-@router.get("/sessions", response_model=list[ChatSessionOut])
+@router.get("/sessions", response_model=ChatSessionListResponse)
 async def list_sessions(
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(
-        select(ChatSession)
-        .where(ChatSession.user_id == current_user.id)
-        .order_by(ChatSession.created_at.desc())
-    )
-    return result.scalars().all()
+    base_query = select(ChatSession).where(ChatSession.user_id == current_user.id)
+    
+    count_q = select(func.count()).select_from(base_query.subquery())
+    total = (await db.execute(count_q)).scalar_one()
+
+    offset = (page - 1) * limit
+    query = base_query.order_by(ChatSession.created_at.desc()).offset(offset).limit(limit)
+    rows = (await db.execute(query)).scalars().all()
+
+    return ChatSessionListResponse(items=list(rows), total=total, page=page, limit=limit)
 
 
 @router.get("/sessions/{session_id}", response_model=list[ChatMessageOut])

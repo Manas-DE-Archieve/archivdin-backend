@@ -3,7 +3,7 @@ from datetime import datetime
 from sqlalchemy import Column, DateTime, Text, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
 from app.database import Base
-
+from pydantic import BaseModel
 
 class Document(Base):
     __tablename__ = "documents"

@@ -16,6 +16,12 @@ class DocumentOut(BaseModel):
     class Config:
         from_attributes = True
 
+class DocumentListResponse(BaseModel):
+    items: List[DocumentOut]
+    total: int
+    page: int
+    limit: int
+
 
 # ── Chat ───────────────────────────────────────────────────
 class ChatSessionOut(BaseModel):
@@ -26,13 +32,17 @@ class ChatSessionOut(BaseModel):
     class Config:
         from_attributes = True
 
+class ChatSessionListResponse(BaseModel):
+    items: List[ChatSessionOut]
+    total: int
+    page: int
+    limit: int
 
 class SourceChunk(BaseModel):
     chunk_id: str
     document_name: str
     chunk_text: str
     score: float
-
 
 class ChatMessageOut(BaseModel):
     id: UUID
@@ -45,7 +55,6 @@ class ChatMessageOut(BaseModel):
     class Config:
         from_attributes = True
 
-
 class MessageRequest(BaseModel):
     content: str
 
@@ -55,17 +64,14 @@ class RegisterRequest(BaseModel):
     email: str
     password: str
 
-
 class LoginRequest(BaseModel):
     email: str
     password: str
-
 
 class TokenResponse(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
-
 
 class UserOut(BaseModel):
     id: UUID
