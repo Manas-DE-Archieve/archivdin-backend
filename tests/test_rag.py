@@ -1,32 +1,34 @@
+"""
+RAG service tests — all OpenAI calls mocked.
+"""
+import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
+# ── retrieve_chunks ───────────────────────────────────────
+
 @pytest.mark.asyncio
 @patch("app.services.rag.embed_text", new_callable=AsyncMock, return_value=[0.0] * 1536)
-async def test_retrieve_chunks_returns_list(mock_emb):
+async def test_retrieve_chunks_returns_correct_shape(mock_emb):
     from app.services.rag import retrieve_chunks
 
-    row = {
-        "id": "chunk-uuid",
-        "chunk_text": "Тестовый фрагмент документа",
-        "filename": "test.txt",
-        "score": 0.88,
-    }
+    row = {"id": "chunk-uuid", "chunk_text": "Исторический текст", "filename": "delo.txt", "score": 0.88}
     db = AsyncMock()
     mock_result = MagicMock()
     mock_result.mappings.return_value.all.return_value = [row]
     db.execute = AsyncMock(return_value=mock_result)
 
-    chunks = await retrieve_chunks(db, "тестовый вопрос", top_k=3)
+    chunks = await retrieve_chunks(db, "вопрос", top_k=3)
     assert len(chunks) == 1
-    assert chunks[0]["document_name"] == "test.txt"
+    assert chunks[0]["document_name"] == "delo.txt"
+    assert chunks[0]["chunk_text"] == "Исторический текст"
     assert chunks[0]["score"] == 0.88
 
 
 @pytest.mark.asyncio
 @patch("app.services.rag.embed_text", new_callable=AsyncMock, return_value=[0.0] * 1536)
-async def test_retrieve_chunks_empty(mock_emb):
+async def test_retrieve_chunks_empty_db_returns_empty(mock_emb):
     from app.services.rag import retrieve_chunks
 
     db = AsyncMock()
@@ -40,39 +42,133 @@ async def test_retrieve_chunks_empty(mock_emb):
 
 @pytest.mark.asyncio
 @patch("app.services.rag.embed_text", new_callable=AsyncMock, return_value=[0.0] * 1536)
-@patch("app.services.rag.AsyncOpenAI")
-async def test_stream_rag_answer_yields_sources_and_done(mock_openai_cls, mock_emb):
-    from app.services.rag import stream_rag_answer
+async def test_retrieve_chunks_score_rounded(mock_emb):
+    from app.services.rag import retrieve_chunks
 
-    # Mock chunk retrieval
-    row = {"id": "c1", "chunk_text": "Архивный текст", "filename": "doc.txt", "score": 0.9}
+    row = {"id": "x", "chunk_text": "text", "filename": "f.txt", "score": 0.9999999}
     db = AsyncMock()
     mock_result = MagicMock()
     mock_result.mappings.return_value.all.return_value = [row]
     db.execute = AsyncMock(return_value=mock_result)
 
-    # Mock streaming response
-    async def fake_stream_context():
-        mock_stream = MagicMock()
+    chunks = await retrieve_chunks(db, "q")
+    score_str = str(chunks[0]["score"])
+    decimals = len(score_str.split(".")[-1]) if "." in score_str else 0
+    assert decimals <= 4
 
-        async def aiter():
+
+# ── stream_rag_answer ─────────────────────────────────────
+
+def _make_stream_mock(tokens: list[str]):
+    """Build an async iterator that yields fake OpenAI streaming chunks."""
+    async def _aiter():
+        for t in tokens:
             event = MagicMock()
             event.choices = [MagicMock()]
-            event.choices[0].delta.content = "Ответ"
+            event.choices[0].delta.content = t
             yield event
+        # final chunk with no content
+        end = MagicMock()
+        end.choices = [MagicMock()]
+        end.choices[0].delta.content = None
+        yield end
 
-        mock_stream.__aiter__ = lambda self: aiter()
-        return mock_stream
+    return _aiter()
+
+
+@pytest.mark.asyncio
+@patch("app.services.rag.embed_text", new_callable=AsyncMock, return_value=[0.0] * 1536)
+@patch("app.services.rag.AsyncOpenAI")
+async def test_stream_emits_sources_event_first(mock_openai_cls, mock_emb):
+    from app.services.rag import stream_rag_answer
+
+    db, mock_result = AsyncMock(), MagicMock()
+    mock_result.mappings.return_value.all.return_value = [
+        {"id": "c1", "chunk_text": "Текст", "filename": "doc.txt", "score": 0.9}
+    ]
+    db.execute = AsyncMock(return_value=mock_result)
 
     mock_client = MagicMock()
-    mock_client.chat.completions.stream.return_value.__aenter__ = AsyncMock(return_value=fake_stream_context())
-    mock_client.chat.completions.stream.return_value.__aexit__ = AsyncMock(return_value=False)
+    mock_client.chat.completions.create = AsyncMock(return_value=_make_stream_mock(["Ответ"]))
     mock_openai_cls.return_value = mock_client
 
     events = []
     async for line in stream_rag_answer(db, "Вопрос", []):
         events.append(line)
 
-    types = [__import__("json").loads(e[6:])["type"] for e in events if e.startswith("data:")]
-    assert "sources" in types
-    assert "done" in types
+    assert events, "No events emitted"
+    first = json.loads(events[0][6:])
+    assert first["type"] == "sources"
+
+
+@pytest.mark.asyncio
+@patch("app.services.rag.embed_text", new_callable=AsyncMock, return_value=[0.0] * 1536)
+@patch("app.services.rag.AsyncOpenAI")
+async def test_stream_emits_done_event_last(mock_openai_cls, mock_emb):
+    from app.services.rag import stream_rag_answer
+
+    db, mock_result = AsyncMock(), MagicMock()
+    mock_result.mappings.return_value.all.return_value = []
+    db.execute = AsyncMock(return_value=mock_result)
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create = AsyncMock(return_value=_make_stream_mock(["Hello"]))
+    mock_openai_cls.return_value = mock_client
+
+    events = []
+    async for line in stream_rag_answer(db, "Q", []):
+        events.append(line)
+
+    last = json.loads(events[-1][6:])
+    assert last["type"] == "done"
+
+
+@pytest.mark.asyncio
+@patch("app.services.rag.embed_text", new_callable=AsyncMock, return_value=[0.0] * 1536)
+@patch("app.services.rag.AsyncOpenAI")
+async def test_stream_emits_token_events(mock_openai_cls, mock_emb):
+    from app.services.rag import stream_rag_answer
+
+    db, mock_result = AsyncMock(), MagicMock()
+    mock_result.mappings.return_value.all.return_value = []
+    db.execute = AsyncMock(return_value=mock_result)
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create = AsyncMock(
+        return_value=_make_stream_mock(["Го", "лос", " из", " архива"])
+    )
+    mock_openai_cls.return_value = mock_client
+
+    token_events = []
+    async for line in stream_rag_answer(db, "Q", []):
+        payload = json.loads(line[6:])
+        if payload["type"] == "token":
+            token_events.append(payload["data"])
+
+    assert "".join(token_events) == "Голос из архива"
+
+
+@pytest.mark.asyncio
+@patch("app.services.rag.embed_text", new_callable=AsyncMock, return_value=[0.0] * 1536)
+@patch("app.services.rag.AsyncOpenAI")
+async def test_stream_sources_contain_chunk_fields(mock_openai_cls, mock_emb):
+    from app.services.rag import stream_rag_answer
+
+    db, mock_result = AsyncMock(), MagicMock()
+    mock_result.mappings.return_value.all.return_value = [
+        {"id": "abc", "chunk_text": "Важный фрагмент", "filename": "archive.txt", "score": 0.77}
+    ]
+    db.execute = AsyncMock(return_value=mock_result)
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create = AsyncMock(return_value=_make_stream_mock([]))
+    mock_openai_cls.return_value = mock_client
+
+    async for line in stream_rag_answer(db, "Q", []):
+        payload = json.loads(line[6:])
+        if payload["type"] == "sources":
+            src = payload["data"][0]
+            assert src["document_name"] == "archive.txt"
+            assert src["chunk_text"] == "Важный фрагмент"
+            assert src["score"] == 0.77
+            break

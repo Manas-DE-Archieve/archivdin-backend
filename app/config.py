@@ -1,8 +1,11 @@
 from pydantic_settings import BaseSettings
+from pydantic import ConfigDict
 from functools import lru_cache
 
 
 class Settings(BaseSettings):
+    model_config = ConfigDict(env_file=".env", extra="ignore")
+
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/archive"
     openai_api_key: str = ""
     anthropic_api_key: str = ""
@@ -15,9 +18,6 @@ class Settings(BaseSettings):
     chunk_size: int = 800
     chunk_overlap: int = 100
     top_k_chunks: int = 3
-
-    class Config:
-        env_file = ".env"
 
 
 @lru_cache()
