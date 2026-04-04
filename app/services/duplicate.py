@@ -189,7 +189,7 @@ async def validate_duplicates_with_llm(
             confirmed.append({
                 "id": meta["id"],
                 "filename": meta["filename"],
-                "similarity_score": round(float(item.get("score", meta["similarity_score"])), 4),
+                "similarity_score": meta["similarity_score"],  # always use real vector score
             })
 
     return confirmed

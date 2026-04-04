@@ -39,6 +39,7 @@ class SimilarDocument(BaseModel):
 
 class DuplicateDocumentResponse(BaseModel):
     duplicates_found: bool = True
+    action: str = "allow"  # "allow" | "warn" | "block"
     message: str
     similar_documents: List[SimilarDocument]
 

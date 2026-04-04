@@ -26,15 +26,13 @@ router = APIRouter(prefix="/api/documents", tags=["documents"])
 settings = get_settings()
 
 # ── Thresholds ─────────────────────────────────────────────────────────────────
-AUTO_REJECT_THRESHOLD  = 0.98   # ≥ 98% → auto-rejected (near-identical content only)
-MODERATOR_THRESHOLD    = 0.98   # ≥ 98% → needs moderator review (same as auto-reject effectively)
+WARN_THRESHOLD         = 0.70   # ≥ 70% → warn user
+BLOCK_THRESHOLD        = 0.90   # ≥ 90% → block upload
+AUTO_REJECT_THRESHOLD  = 0.98   # ≥ 98% → auto-rejected on actual upload
+MODERATOR_THRESHOLD    = 0.98   # ≥ 98% → needs moderator review
 
 
 async def _compute_doc_similarity(db: AsyncSession, raw_text: str) -> tuple[float | None, str | None]:
-    """
-    Compare uploaded document against all existing chunk embeddings.
-    Returns (max_avg_score, most_similar_doc_id).
-    """
     candidates = await find_similar_documents(db, raw_text, threshold=0.0, limit=1)
     if not candidates:
         return None, None
@@ -78,7 +76,6 @@ async def _auto_extract_and_create_person(db: AsyncSession, doc: Document, raw_t
                 doc.status = "processed"
                 return
 
-            # Convert date strings to date objects
             from datetime import date
             for date_field in ("arrest_date", "sentence_date", "rehabilitation_date"):
                 val = data.get(date_field)
@@ -107,11 +104,15 @@ async def _auto_extract_and_create_person(db: AsyncSession, doc: Document, raw_t
 
 
 async def _generate_facts_background(doc_id, filename: str, raw_text: str):
+    print(f"INFO:     Starting facts generation for '{filename}' (doc_id={doc_id})")
     try:
         async with AsyncSessionLocal() as bg_db:
-            await generate_and_save_facts(bg_db, doc_id, filename, raw_text)
+            facts = await generate_and_save_facts(bg_db, doc_id, filename, raw_text)
+            print(f"INFO:     Facts generation done for '{filename}': {len(facts)} facts saved")
     except Exception as e:
+        import traceback
         print(f"ERROR:    Background facts generation failed for '{filename}': {e}")
+        print(traceback.format_exc())
 
 
 @router.post("/check-duplicates", response_model=DuplicateDocumentResponse)
@@ -129,39 +130,60 @@ async def check_document_duplicates(
     else:
         raw_text = content.decode("utf-8", errors="replace")
 
+    # ── Exact duplicate check ──────────────────────────────────────────────────
     content_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
-    exact_q = await db.execute(select(Document).where(Document.content_hash == content_hash, Document.verification_status != "auto_rejected"))
+    exact_q = await db.execute(select(Document).where(
+        Document.content_hash == content_hash,
+        Document.verification_status != "auto_rejected"
+    ))
     exact = exact_q.scalars().first()
     if exact:
         return DuplicateDocumentResponse(
             duplicates_found=True,
+            action="block",
             message=f"Документ с идентичным содержимым уже существует: «{exact.filename}».",
             similar_documents=[
                 SimilarDocument(id=exact.id, filename=exact.filename, similarity_score=1.0)
             ],
         )
 
-    candidates = await find_similar_documents(db, raw_text, threshold=0.30, limit=3)
+    # ── Vector similarity check ────────────────────────────────────────────────
+    candidates = await find_similar_documents(db, raw_text, threshold=0.10, limit=5)
     if not candidates:
         return DuplicateDocumentResponse(
             duplicates_found=False,
+            action="allow",
             message="Совпадений не найдено. Документ можно загрузить.",
             similar_documents=[],
         )
 
-    confirmed = await validate_duplicates_with_llm(raw_text, candidates)
-    if confirmed:
+    similar_docs = [
+        SimilarDocument(id=c["id"], filename=c["filename"], similarity_score=c["similarity_score"])
+        for c in candidates
+    ]
+    max_score = max(c["similarity_score"] for c in candidates)
+
+    if max_score >= BLOCK_THRESHOLD:
         return DuplicateDocumentResponse(
             duplicates_found=True,
-            message=f"Найдено {len(confirmed)} похожих документов.",
-            similar_documents=[SimilarDocument(**s) for s in confirmed],
+            action="block",
+            message=f"Загрузка запрещена: схожесть {round(max_score * 100)}% превышает порог 90%. Этот документ уже существует в архиве.",
+            similar_documents=similar_docs,
         )
-
-    return DuplicateDocumentResponse(
-        duplicates_found=False,
-        message="Совпадений не найдено. Документ можно загрузить.",
-        similar_documents=[],
-    )
+    elif max_score >= WARN_THRESHOLD:
+        return DuplicateDocumentResponse(
+            duplicates_found=True,
+            action="warn",
+            message=f"Найдены похожие документы (схожесть до {round(max_score * 100)}%). Вы уверены, что хотите загрузить?",
+            similar_documents=similar_docs,
+        )
+    else:
+        return DuplicateDocumentResponse(
+            duplicates_found=False,
+            action="allow",
+            message=f"Найдены документы со схожим содержимым (схожесть до {round(max_score * 100)}%).",
+            similar_documents=similar_docs,
+        )
 
 
 @router.post("/upload", response_model=DocumentOut, status_code=201)
@@ -198,13 +220,13 @@ async def upload_document(
         filename=filename,
         file_type=file_type,
         raw_text=raw_text,
-        content_hash=None if force else content_hash,  # skip unique constraint on force
+        content_hash=None if force else content_hash,
         status="processing",
-        verification_status="verified",   # will update below
+        verification_status="verified",
         uploaded_by=current_user.id,
     )
     db.add(doc)
-    await db.flush()  # get doc.id
+    await db.flush()
 
     # ── Chunk + embed ──────────────────────────────────────────────────────────
     chunks_text = chunk_text(raw_text)
@@ -215,10 +237,9 @@ async def upload_document(
             for i, (txt, emb) in enumerate(zip(chunks_text, embeddings))
         ]
         db.add_all(chunk_objects)
-        await db.flush()  # chunks must be in DB before similarity query
+        await db.flush()
 
     # ── Similarity check against existing docs ────────────────────────────────
-    # Query avg chunk similarity excluding the just-uploaded doc
     from sqlalchemy import text as sa_text
     sample = raw_text[:3000].strip()
     similarity_score = None
@@ -256,19 +277,17 @@ async def upload_document(
     doc.duplicate_of_id = duplicate_of_id
 
     if similarity_score is not None and similarity_score >= AUTO_REJECT_THRESHOLD:
-        # Auto-reject: block the upload entirely
         doc.verification_status = "auto_rejected"
         await db.commit()
         raise HTTPException(
             status_code=409,
             detail={
-                "message": f"Документ автоматически отклонён: схожесть {round(similarity_score * 100)}% превышает порог 85%.",
+                "message": f"Документ автоматически отклонён: схожесть {round(similarity_score * 100)}% превышает порог 98%.",
                 "similarity_score": similarity_score,
                 "duplicate_of_id": str(duplicate_of_id) if duplicate_of_id else None,
             }
         )
     elif similarity_score is not None and similarity_score >= MODERATOR_THRESHOLD:
-        # Flag for moderator review
         doc.verification_status = "pending"
     else:
         doc.verification_status = "verified"

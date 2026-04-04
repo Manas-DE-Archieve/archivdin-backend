@@ -1,9 +1,8 @@
 """
-Auth endpoint tests — uses real HTTP client against in-memory app (no live DB needed for logic tests).
-The conftest.py already sets up a test DB; these tests mock at the service level where possible.
+Auth endpoint tests.
+Uses real HTTP client with in-memory test DB (configured in conftest.py).
 """
 import pytest
-from unittest.mock import AsyncMock, patch
 from httpx import AsyncClient
 
 
@@ -15,7 +14,7 @@ async def test_register_success(client: AsyncClient):
     assert data["email"] == "new_user@test.com"
     assert data["role"] == "user"
     assert "id" in data
-    assert "password_hash" not in data  # never expose hash
+    assert "password_hash" not in data
 
 
 @pytest.mark.asyncio
@@ -82,3 +81,38 @@ async def test_refresh_token_works(client: AsyncClient):
     res = await client.post("/api/auth/refresh", params={"token": refresh_token})
     assert res.status_code == 200
     assert "access_token" in res.json()
+
+
+@pytest.mark.asyncio
+async def test_refresh_with_access_token_fails(client: AsyncClient):
+    """Access token must not be accepted as a refresh token."""
+    await client.post("/api/auth/register", json={"email": "badrefresh@test.com", "password": "pass1234"})
+    login = await client.post("/api/auth/login", json={"email": "badrefresh@test.com", "password": "pass1234"})
+    access_token = login.json()["access_token"]
+
+    res = await client.post("/api/auth/refresh", params={"token": access_token})
+    assert res.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_setup_super_admin_creates_admin(client: AsyncClient):
+    res = await client.post(
+        "/api/auth/setup-super-admin",
+        json={"email": "admin@test.com", "password": "adminpass"},
+    )
+    assert res.status_code == 201
+    assert res.json()["role"] == "super_admin"
+
+
+@pytest.mark.asyncio
+async def test_setup_super_admin_second_call_fails(client: AsyncClient):
+    """Only one super_admin can be created via this endpoint."""
+    await client.post(
+        "/api/auth/setup-super-admin",
+        json={"email": "admin1@test.com", "password": "adminpass"},
+    )
+    res = await client.post(
+        "/api/auth/setup-super-admin",
+        json={"email": "admin2@test.com", "password": "adminpass"},
+    )
+    assert res.status_code == 400
