@@ -162,15 +162,13 @@ async def list_persons(
             query = query.where(Person.charge.ilike(f"%{charge}%"))
 
     if region:
-        query = query.where(Person.region == region)
+        query = query.where(Person.region.ilike(f"%{region}%"))
     if year_from:
         query = query.where(Person.birth_year >= year_from)
     if year_to:
         query = query.where(Person.birth_year <= year_to)
     if status:
         query = query.where(Person.status == status)
-    else:
-        query = query.where(Person.status == "verified")
 
     count_q = select(func.count()).select_from(query.subquery())
     total = (await db.execute(count_q)).scalar_one()
