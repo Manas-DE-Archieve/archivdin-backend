@@ -1,12 +1,12 @@
 import json
 import hashlib
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, func
 from openai import AsyncOpenAI
 
-from app.database import get_db
+from app.database import get_db, AsyncSessionLocal
 from app.models.document import Document
 from app.models.chunk import Chunk
 from app.models.person import Person
@@ -45,7 +45,7 @@ async def _auto_extract_and_create_person(db: AsyncSession, doc: Document, raw_t
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"}
         )
-        
+
         message_content = response.choices[0].message.content
         if not message_content:
             print(f"INFO:     OpenAI returned no content for '{doc.filename}'. Skipping person extraction.")
@@ -79,16 +79,21 @@ async def _auto_extract_and_create_person(db: AsyncSession, doc: Document, raw_t
         print(f"ERROR:    Failed to extract person from '{doc.filename}': {e}")
 
 
+async def _generate_facts_background(doc_id, filename: str, raw_text: str):
+    """Background task: generates facts using a fresh DB session (safe outside request context)."""
+    try:
+        async with AsyncSessionLocal() as bg_db:
+            await generate_and_save_facts(bg_db, doc_id, filename, raw_text)
+    except Exception as e:
+        print(f"ERROR:    Background facts generation failed for '{filename}': {e}")
+
+
 @router.post("/check-duplicates", response_model=DuplicateDocumentResponse)
 async def check_document_duplicates(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    """
-    Pre-upload check: returns similar existing documents with similarity score (0–1).
-    Call this before /upload to warn the user about possible duplicates.
-    """
     content = await file.read()
     filename = file.filename or "unknown"
     content_type = file.content_type or ""
@@ -98,7 +103,6 @@ async def check_document_duplicates(
     else:
         raw_text = content.decode("utf-8", errors="replace")
 
-    # Exact hash match → 100% duplicate
     content_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
     exact_q = await db.execute(select(Document).where(Document.content_hash == content_hash))
     exact = exact_q.scalars().first()
@@ -111,7 +115,6 @@ async def check_document_duplicates(
             ],
         )
 
-    # Phase 1: vector similarity (wider net, lower threshold)
     candidates = await find_similar_documents(db, raw_text, threshold=0.60, limit=3)
 
     if not candidates:
@@ -121,7 +124,6 @@ async def check_document_duplicates(
             similar_documents=[],
         )
 
-    # Phase 2: LLM validates which candidates are TRUE duplicates
     confirmed = await validate_duplicates_with_llm(raw_text, candidates)
 
     if confirmed:
@@ -140,6 +142,7 @@ async def check_document_duplicates(
 
 @router.post("/upload", response_model=DocumentOut, status_code=201)
 async def upload_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -147,17 +150,16 @@ async def upload_document(
     content = await file.read()
     filename = file.filename or "unknown"
     content_type = file.content_type or ""
-    
+
     if "pdf" in content_type or filename.endswith(".pdf"):
         raw_text = extract_pdf_text(content)
         file_type = "pdf"
     else:
         raw_text = content.decode("utf-8", errors="replace")
         file_type = "txt" if not filename.endswith(".md") else "md"
-        
+
     content_hash = hashlib.sha256(raw_text.encode('utf-8')).hexdigest()
 
-    # ИСПРАВЛЕНИЕ: Проверяем дубликат по ХЭШУ по ВСЕЙ базе, а не только у текущего юзера
     existing_doc_q = await db.execute(
         select(Document).where(Document.content_hash == content_hash)
     )
@@ -192,13 +194,8 @@ async def upload_document(
     await db.commit()
     await db.refresh(doc)
 
-    # Generate facts in background (non-blocking for response)
-    import asyncio
-    from app.database import AsyncSessionLocal
-    async def _gen_facts():
-        async with AsyncSessionLocal() as bg_db:
-            await generate_and_save_facts(bg_db, doc.id, filename, raw_text)
-    asyncio.create_task(_gen_facts())
+    # ✅ FIXED: Use BackgroundTasks instead of asyncio.create_task (safe & reliable)
+    background_tasks.add_task(_generate_facts_background, doc.id, filename, raw_text)
 
     return doc
 
@@ -252,7 +249,7 @@ async def delete_document(
 
     if not is_owner and not is_admin_or_mod:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
-    
+
     await db.execute(delete(Person).where(Person.document_id == doc_id))
     await db.execute(delete(Chunk).where(Chunk.document_id == doc_id))
     await db.delete(doc)

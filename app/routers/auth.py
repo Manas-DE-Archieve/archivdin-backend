@@ -75,7 +75,6 @@ async def get_optional_user(
     token: Optional[str] = Depends(oauth2_scheme_optional),
     db: AsyncSession = Depends(get_db)
 ) -> Optional[User]:
-    """Returns user if token provided, None otherwise."""
     if not token:
         return None
     try:
@@ -130,3 +129,34 @@ async def refresh_token(token: str, db: AsyncSession = Depends(get_db)):
 @router.get("/me", response_model=UserOut)
 async def me(current_user: User = Depends(get_current_user)):
     return current_user
+
+
+@router.post("/setup-super-admin", response_model=UserOut, status_code=201)
+async def setup_super_admin(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
+    """
+    One-time setup endpoint: creates the first super_admin account.
+    Fails if any super_admin already exists in the database.
+    Disable or remove this endpoint after initial setup for security.
+    """
+    # Check if super_admin already exists
+    existing_sa = await db.execute(select(User).where(User.role == "super_admin"))
+    if existing_sa.scalar_one_or_none():
+        raise HTTPException(
+            status_code=400,
+            detail="Super admin already exists. This endpoint is disabled."
+        )
+
+    # Check email not taken
+    existing_email = await db.execute(select(User).where(User.email == body.email))
+    if existing_email.scalar_one_or_none():
+        raise HTTPException(400, "Email already registered")
+
+    user = User(
+        email=body.email,
+        password_hash=hash_password(body.password),
+        role="super_admin"
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    return user

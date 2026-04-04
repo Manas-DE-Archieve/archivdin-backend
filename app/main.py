@@ -1,117 +1,30 @@
-# --- START OF FILE backend/app/main.py ---
-
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import json
-import hashlib # <-- ДОБАВЛЕНО
-from datetime import date
-from pathlib import Path
 
 from app.database import init_db, AsyncSessionLocal
 from app.routers import auth, persons, documents, chat, admin, facts
-from app.models import Person, Document, Chunk
-from app.services.embedding import embed_text, embed_batch
-from app.services.chunker import chunk_text
-from sqlalchemy import select
+from sqlalchemy import text
 
 
-async def seed_data_if_needed():
-    """Заполняет БД начальными данными из seed.json, если таблица persons пуста."""
+async def ensure_pg_extensions():
+    """Enable pg_trgm extension required for similarity() function."""
     async with AsyncSessionLocal() as db:
-        result = await db.execute(select(Person).limit(1))
-        if result.first():
-            return
-
-        print("INFO:     Database is empty. Seeding initial persons...")
         try:
-            with open("/app/seed.json", "r", encoding="utf-8") as f:
-                persons_data = json.load(f)
-
-            for p_data in persons_data:
-                p_data.pop('id', None)
-                for key in ['arrest_date', 'sentence_date', 'rehabilitation_date']:
-                    if p_data.get(key):
-                        p_data[key] = date.fromisoformat(p_data[key])
-                    else:
-                        p_data[key] = None
-
-                embedding = await embed_text(p_data["full_name"])
-                person = Person(**p_data, name_embedding=embedding, document_id=None)
-                db.add(person)
-
+            await db.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
             await db.commit()
-            print(f"INFO:     Seeded {len(persons_data)} persons.")
+            print("INFO:     pg_trgm extension ensured.")
         except Exception as e:
-            print(f"ERROR:    Failed to seed persons data: {e}")
+            print(f"WARNING:  Could not create pg_trgm extension: {e}")
             await db.rollback()
 
-async def seed_documents_if_needed():
-    """Заполняет БД начальными документами, если таблица documents пуста."""
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(Document).limit(1))
-        if result.first():
-            return
-
-        print("INFO:     Documents table is empty. Seeding initial documents...")
-        docs_path = Path("/app/test_documents")
-        
-        if not docs_path.exists():
-            print(f"WARNING:  Directory not found: {docs_path.resolve()}, skipping document seeding.")
-            return
-
-        files_to_seed = list(docs_path.glob("*.txt"))
-        if not files_to_seed:
-            print(f"INFO:     No documents to seed in {docs_path.resolve()}.")
-            return
-            
-        try:
-            for file_path in files_to_seed:
-                content = file_path.read_text(encoding="utf-8")
-                filename = file_path.name
-                
-                # ИСПРАВЛЕНИЕ: Вычисляем и сохраняем хэш для начальных документов
-                content_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
-
-                doc = Document(
-                    filename=filename,
-                    file_type="txt",
-                    raw_text=content,
-                    content_hash=content_hash, # <-- Сохраняем хэш
-                    uploaded_by=None,
-                    status="processed"
-                )
-                db.add(doc)
-                await db.flush()
-
-                chunks_text = chunk_text(content)
-                if not chunks_text:
-                    continue
-
-                embeddings = await embed_batch(chunks_text)
-                chunk_objects = [
-                    Chunk(
-                        document_id=doc.id,
-                        chunk_text=chunks_text[i],
-                        chunk_index=i,
-                        embedding=embeddings[i],
-                    )
-                    for i in range(len(chunks_text))
-                ]
-                db.add_all(chunk_objects)
-
-            await db.commit()
-            print(f"INFO:     Seeded {len(files_to_seed)} documents.")
-        except Exception as e:
-            print(f"ERROR:    Failed to seed documents: {e}")
-            await db.rollback()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    await seed_data_if_needed()
-    await seed_documents_if_needed()
+    await ensure_pg_extensions()
     yield
+
 
 app = FastAPI(
     title="Архивдин Үнү API",
@@ -134,6 +47,7 @@ app.include_router(documents.router)
 app.include_router(chat.router)
 app.include_router(admin.router)
 app.include_router(facts.router)
+
 
 @app.get("/health")
 async def health():
