@@ -4,6 +4,10 @@
 import os
 import pytest
 import pytest_asyncio
+from dotenv import load_dotenv
+
+# Load test env vars if .env.test exists
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env.test'), override=False)
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy import text

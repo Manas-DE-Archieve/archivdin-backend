@@ -116,8 +116,8 @@ async def list_pending_documents(
     current_user: User = Depends(require_role("moderator", "super_admin")),
 ):
     """
-    Returns documents pending moderation, sorted by similarity_score DESC.
-    Moderator sees highest-risk items first.
+    Документы, ожидающие ручной проверки (схожесть 85–97%).
+    Сортировка по similarity_score DESC — наиболее рискованные сверху.
     """
     query = select(Document).where(Document.verification_status == "pending")
 
@@ -149,6 +149,64 @@ async def verify_document(
         raise HTTPException(404, "Document not found")
     if body.status not in ("verified", "rejected"):
         raise HTTPException(400, "Status must be 'verified' or 'rejected'")
+    doc.verification_status = body.status
+    await db.commit()
+    await db.refresh(doc)
+    return doc
+
+
+# ── Auto-rejected documents ────────────────────────────────────────────────────
+
+@router.get("/auto-rejected-documents", response_model=DocumentListResponse)
+async def list_auto_rejected_documents(
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role("moderator", "super_admin")),
+):
+    """
+    Документы, автоматически отклонённые из-за высокой схожести (≥ 98%).
+    Модератор может восстановить их или окончательно отклонить.
+    """
+    query = select(Document).where(Document.verification_status == "auto_rejected")
+
+    count_q = select(func.count()).select_from(query.subquery())
+    total = (await db.execute(count_q)).scalar_one()
+
+    offset = (page - 1) * limit
+    rows = (await db.execute(
+        query.order_by(Document.similarity_score.desc().nulls_last())
+             .offset(offset).limit(limit)
+    )).scalars().all()
+
+    return DocumentListResponse(items=list(rows), total=total, page=page, limit=limit)
+
+
+@router.patch("/documents/{doc_id}/override", response_model=DocumentOut)
+async def override_auto_rejected_document(
+    doc_id: UUID,
+    body: DocumentVerifyRequest,  # status = "verified" | "rejected"
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role("moderator", "super_admin")),
+):
+    """
+    Ручное решение по авто-отклонённому документу:
+      - "verified" → восстановить в архив
+      - "rejected" → подтвердить отклонение
+    """
+    result = await db.execute(select(Document).where(Document.id == doc_id))
+    doc = result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(404, "Document not found")
+    if doc.verification_status != "auto_rejected":
+        raise HTTPException(
+            400,
+            "Этот эндпоинт только для авто-отклонённых документов. "
+            "Для pending используйте /verify."
+        )
+    if body.status not in ("verified", "rejected"):
+        raise HTTPException(400, "Status must be 'verified' or 'rejected'")
+
     doc.verification_status = body.status
     await db.commit()
     await db.refresh(doc)

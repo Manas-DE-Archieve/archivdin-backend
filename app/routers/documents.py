@@ -26,10 +26,10 @@ router = APIRouter(prefix="/api/documents", tags=["documents"])
 settings = get_settings()
 
 # ── Thresholds ─────────────────────────────────────────────────────────────────
-WARN_THRESHOLD         = 0.70   # ≥ 70% → warn user
-BLOCK_THRESHOLD        = 0.90   # ≥ 90% → block upload
-AUTO_REJECT_THRESHOLD  = 0.98   # ≥ 98% → auto-rejected on actual upload
-MODERATOR_THRESHOLD    = 0.98   # ≥ 98% → needs moderator review
+WARN_THRESHOLD        = 0.70   # ≥ 70% → предупреждение пользователю
+BLOCK_THRESHOLD       = 0.90   # ≥ 90% → блокировка загрузки
+MODERATOR_THRESHOLD   = 0.85   # ≥ 85% → на проверку модератору (pending)
+AUTO_REJECT_THRESHOLD = 0.98   # ≥ 98% → авто-отклонение без модерации
 
 
 async def _compute_doc_similarity(db: AsyncSession, raw_text: str) -> tuple[float | None, str | None]:
@@ -277,6 +277,7 @@ async def upload_document(
     doc.duplicate_of_id = duplicate_of_id
 
     if similarity_score is not None and similarity_score >= AUTO_REJECT_THRESHOLD:
+        # ≥ 98% — сохраняем в БД и отклоняем. Видно модератору в /admin/auto-rejected-documents
         doc.verification_status = "auto_rejected"
         await db.commit()
         raise HTTPException(
@@ -288,8 +289,10 @@ async def upload_document(
             }
         )
     elif similarity_score is not None and similarity_score >= MODERATOR_THRESHOLD:
+        # 85–97% — на проверку модератору
         doc.verification_status = "pending"
     else:
+        # < 85% — сразу в архив
         doc.verification_status = "verified"
 
     # ── Person extraction ──────────────────────────────────────────────────────
